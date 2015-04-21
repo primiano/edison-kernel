@@ -89,6 +89,7 @@
 #define  SDHCI_POWER_180	0x0A
 #define  SDHCI_POWER_300	0x0C
 #define  SDHCI_POWER_330	0x0E
+#define	 SDHCI_HW_RESET		0x10
 
 #define SDHCI_BLOCK_GAP_CONTROL	0x2A
 
@@ -130,6 +131,7 @@
 #define  SDHCI_INT_ERROR	0x00008000
 #define  SDHCI_INT_TIMEOUT	0x00010000
 #define  SDHCI_INT_CRC		0x00020000
+#define  SDHCI_INT_CMD_CONFLICT	0x00030000
 #define  SDHCI_INT_END_BIT	0x00040000
 #define  SDHCI_INT_INDEX	0x00080000
 #define  SDHCI_INT_DATA_TIMEOUT	0x00100000
@@ -160,7 +162,8 @@
 #define   SDHCI_CTRL_UHS_SDR50		0x0002
 #define   SDHCI_CTRL_UHS_SDR104		0x0003
 #define   SDHCI_CTRL_UHS_DDR50		0x0004
-#define   SDHCI_CTRL_HS_SDR200		0x0005 /* reserved value in SDIO spec */
+#define   SDHCI_CTRL_HS_SDR200		SDHCI_CTRL_UHS_SDR104
+#define   SDHCI_CTRL_HS_DDR200		0x0005
 #define  SDHCI_CTRL_VDD_180		0x0008
 #define  SDHCI_CTRL_DRV_TYPE_MASK	0x0030
 #define   SDHCI_CTRL_DRV_TYPE_B		0x0000
@@ -234,6 +237,7 @@
 #define SDHCI_PRESET_FOR_SDR50 0x6A
 #define SDHCI_PRESET_FOR_SDR104        0x6C
 #define SDHCI_PRESET_FOR_DDR50 0x6E
+#define SDHCI_PRESET_FOR_HS400 0x74
 #define SDHCI_PRESET_DRV_MASK  0xC000
 #define SDHCI_PRESET_DRV_SHIFT  14
 #define SDHCI_PRESET_CLKGEN_SEL_MASK   0x400
@@ -294,6 +298,11 @@ struct sdhci_ops {
 	void	(*platform_resume)(struct sdhci_host *host);
 	void    (*adma_workaround)(struct sdhci_host *host, u32 intmask);
 	void	(*platform_init)(struct sdhci_host *host);
+	int	(*power_up_host)(struct sdhci_host *host);
+	void	(*set_dev_power)(struct sdhci_host *, bool);
+	int	(*get_cd)(struct sdhci_host *host);
+	int	(*get_tuning_count)(struct sdhci_host *host);
+	int	(*gpio_buf_check)(struct sdhci_host *host, unsigned int clk);
 };
 
 #ifdef CONFIG_MMC_SDHCI_IO_ACCESSORS
@@ -392,6 +401,7 @@ static inline void *sdhci_priv(struct sdhci_host *host)
 extern void sdhci_card_detect(struct sdhci_host *host);
 extern int sdhci_add_host(struct sdhci_host *host);
 extern void sdhci_remove_host(struct sdhci_host *host, int dead);
+extern int sdhci_try_get_regulator(struct sdhci_host *host);
 
 #ifdef CONFIG_PM
 extern int sdhci_suspend_host(struct sdhci_host *host);
@@ -404,4 +414,5 @@ extern int sdhci_runtime_suspend_host(struct sdhci_host *host);
 extern int sdhci_runtime_resume_host(struct sdhci_host *host);
 #endif
 
+extern void sdhci_alloc_panic_host(struct sdhci_host *host);
 #endif /* __SDHCI_HW_H */

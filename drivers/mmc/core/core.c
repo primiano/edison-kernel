@@ -1405,7 +1405,10 @@ int mmc_set_signal_voltage(struct mmc_host *host, int signal_voltage)
 	mmc_set_ios(host);
 
 	/* Wait for at least 1 ms according to spec */
-	mmc_delay(1);
+	if (host->ops->busy_wait)
+		host->ops->busy_wait(host, 1000);
+	else
+		mmc_delay(1);
 
 	/*
 	 * Failure to switch is indicated by the card holding
@@ -1468,6 +1471,9 @@ static void mmc_power_up(struct mmc_host *host)
 
 	mmc_host_clk_hold(host);
 
+	if (host->ops->set_dev_power)
+		host->ops->set_dev_power(host, true);
+
 	/* If ocr is set, we use it */
 	if (host->ocr)
 		bit = ffs(host->ocr) - 1;
@@ -1492,7 +1498,7 @@ static void mmc_power_up(struct mmc_host *host)
 	 * This delay should be sufficient to allow the power supply
 	 * to reach the minimum voltage.
 	 */
-	mmc_delay(10);
+	usleep_range(10000, 11000);
 
 	host->ios.clock = host->f_init;
 
@@ -1503,7 +1509,7 @@ static void mmc_power_up(struct mmc_host *host)
 	 * This delay must be at least 74 clock sizes, or 1 ms, or the
 	 * time required to reach a stable voltage.
 	 */
-	mmc_delay(10);
+	usleep_range(5000, 6000);
 
 	mmc_host_clk_release(host);
 }
@@ -1533,6 +1539,9 @@ void mmc_power_off(struct mmc_host *host)
 	host->ios.bus_width = MMC_BUS_WIDTH_1;
 	host->ios.timing = MMC_TIMING_LEGACY;
 	mmc_set_ios(host);
+
+	if (host->ops->set_dev_power)
+		host->ops->set_dev_power(host, false);
 
 	/*
 	 * Some configurations, such as the 802.11 SDIO card in the OLPC
@@ -1690,7 +1699,7 @@ void mmc_init_erase(struct mmc_card *card)
 		card->erase_shift = ffs(card->ssr.au) - 1;
 	} else if (card->ext_csd.hc_erase_size) {
 		card->pref_erase = card->ext_csd.hc_erase_size;
-	} else {
+	} else if (card->erase_size) {
 		sz = (card->csd.capacity << (card->csd.read_blkbits - 9)) >> 11;
 		if (sz < 128)
 			card->pref_erase = 512 * 1024 / 512;
@@ -1707,7 +1716,8 @@ void mmc_init_erase(struct mmc_card *card)
 			if (sz)
 				card->pref_erase += card->erase_size - sz;
 		}
-	}
+	} else
+		card->pref_erase = 0;
 }
 
 static unsigned int mmc_mmc_erase_timeout(struct mmc_card *card,
@@ -2408,7 +2418,8 @@ void mmc_rescan(struct work_struct *work)
 	mmc_release_host(host);
 
  out:
-	if (host->caps & MMC_CAP_NEEDS_POLL)
+	mmc_emergency_setup(host);
+	if (host->caps & MMC_CAP_NEEDS_POLL) 
 		mmc_schedule_delayed_work(&host->detect, HZ);
 }
 
@@ -2421,6 +2432,8 @@ void mmc_start_host(struct mmc_host *host)
 	else
 		mmc_power_up(host);
 	mmc_detect_change(host, 0);
+	if (host->caps2 & MMC_CAP2_INIT_CARD_SYNC)
+		flush_work_sync(&host->detect.work);
 }
 
 void mmc_stop_host(struct mmc_host *host)

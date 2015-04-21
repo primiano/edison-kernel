@@ -51,6 +51,7 @@
 #include <linux/usb/gadget.h>
 
 /* Global constants */
+#define DWC3_SCRATCH_BUF_SIZE	4096
 #define DWC3_EP0_BOUNCE_SIZE	512
 #define DWC3_ENDPOINTS_NUM	32
 #define DWC3_XHCI_RESOURCES_NUM	2
@@ -194,6 +195,10 @@
 #define DWC3_GTXFIFOSIZ_TXFDEF(n)	((n) & 0xffff)
 #define DWC3_GTXFIFOSIZ_TXFSTADDR(n)	((n) & 0xffff0000)
 
+/* Global Event Size Registers */
+#define DWC3_GEVNTSIZ_INTMASK		(1 << 31)
+#define DWC3_GEVNTSIZ_SIZE(n)		((n) & 0xffff)
+
 /* Global HWPARAMS1 Register */
 #define DWC3_GHWPARAMS1_EN_PWROPT(n)	(((n) & (3 << 24)) >> 24)
 #define DWC3_GHWPARAMS1_EN_PWROPT_NO	0
@@ -309,6 +314,7 @@
 #define DWC3_DGCMD_SET_LMP		0x01
 #define DWC3_DGCMD_SET_PERIODIC_PAR	0x02
 #define DWC3_DGCMD_XMIT_FUNCTION	0x03
+#define DWC3_DGCMD_SET_SCRATCH_ADDR_LO	0x04
 
 /* These apply for core versions 1.94a and later */
 #define DWC3_DGCMD_SET_SCRATCHPAD_ADDR_LO	0x04
@@ -408,9 +414,11 @@ struct dwc3_event_buffer {
  * @trb_pool_dma: dma address of @trb_pool
  * @free_slot: next slot which is going to be used
  * @busy_slot: first slot which is owned by HW
+ * @ep_state: endpoint state
  * @desc: usb_endpoint_descriptor pointer
  * @dwc: pointer to DWC controller
  * @flags: endpoint flags (wedged, stalled, ...)
+ * @flags_backup: backup endpoint flags
  * @current_trb: index of current used trb
  * @number: endpoint number (1 - 15)
  * @type: set to bmAttributes & USB_ENDPOINT_XFERTYPE_MASK
@@ -429,16 +437,23 @@ struct dwc3_ep {
 	dma_addr_t		trb_pool_dma;
 	u32			free_slot;
 	u32			busy_slot;
+	u32			ep_state;
 	const struct usb_ss_ep_comp_descriptor *comp_desc;
 	struct dwc3		*dwc;
 
+	struct ebc_io		*ebc;
+#define DWC3_EP_EBC_OUT_NB	16
+#define DWC3_EP_EBC_IN_NB	17
+
 	unsigned		flags;
+	unsigned		flags_backup;
 #define DWC3_EP_ENABLED		(1 << 0)
 #define DWC3_EP_STALL		(1 << 1)
 #define DWC3_EP_WEDGE		(1 << 2)
 #define DWC3_EP_BUSY		(1 << 4)
 #define DWC3_EP_PENDING_REQUEST	(1 << 5)
 #define DWC3_EP_MISSED_ISOC	(1 << 6)
+#define DWC3_EP_HIBERNATION	(1 << 7)
 
 	/* This last one is specific to EP0 */
 #define DWC3_EP0_DIR_IN		(1 << 31)
@@ -493,6 +508,13 @@ enum dwc3_link_state {
 	DWC3_LINK_STATE_RESET		= 0x0e,
 	DWC3_LINK_STATE_RESUME		= 0x0f,
 	DWC3_LINK_STATE_MASK		= 0x0f,
+};
+
+enum dwc3_pm_state {
+	PM_DISCONNECTED = 0,
+	PM_ACTIVE,
+	PM_SUSPENDED,
+	PM_RESUMING,
 };
 
 /* TRB Length, PCM and Status */
@@ -600,6 +622,7 @@ struct dwc3_request {
 	unsigned		direction:1;
 	unsigned		mapped:1;
 	unsigned		queued:1;
+	unsigned		short_packet:1;
 };
 
 /*
@@ -608,6 +631,22 @@ struct dwc3_request {
  */
 struct dwc3_scratchpad_array {
 	__le64	dma_adr[DWC3_MAX_HIBER_SCRATCHBUFS];
+};
+
+/**
+ * struct dwc3_hwregs - registers saved when entering hibernation
+ */
+struct dwc3_hwregs {
+	u32	guctl;
+	u32	dcfg;
+	u32	devten;
+	u32	gctl;
+	u32	gusb3pipectl0;
+	u32	gusb2phycfg0;
+	u32	gevntadrlo;
+	u32	gevntadrhi;
+	u32	gevntsiz;
+	u32	grxthrcfg;
 };
 
 /**
@@ -727,6 +766,7 @@ struct dwc3 {
 	unsigned		needs_fifo_resize:1;
 	unsigned		resize_fifos:1;
 	unsigned		pullups_connected:1;
+	unsigned		quirks_disable_irqthread:1;
 
 	enum dwc3_ep0_next	ep0_next_event;
 	enum dwc3_ep0_state	ep0state;
@@ -748,9 +788,23 @@ struct dwc3 {
 	struct dwc3_hwparams	hwparams;
 	struct dentry		*root;
 	struct debugfs_regset32	*regset;
+	enum dwc3_pm_state	pm_state;
+	u8			is_otg;
+	u8			soft_connected;
 
 	u8			test_mode;
 	u8			test_mode_nr;
+
+	/* delayed work for handling Link State Change */
+	struct delayed_work	link_work;
+
+	u8			is_ebc;
+
+	struct dwc3_scratchpad_array	*scratch_array;
+	dma_addr_t		scratch_array_dma;
+	void			*scratch_buffer[DWC3_MAX_HIBER_SCRATCHBUFS];
+	struct dwc3_hwregs	hwregs;
+	bool			hiber_enabled;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -876,6 +930,23 @@ union dwc3_event {
 	struct dwc3_event_devt		devt;
 	struct dwc3_event_gevt		gevt;
 };
+
+struct ebc_io {
+	const char	*name;
+	const char	*epname;
+	u8		epnum;
+	u8		is_ondemand;
+	u8		static_trb_pool_size;
+	struct list_head	list;
+	int		(*init) (void);
+	void		*(*alloc_static_trb_pool) (dma_addr_t *dma_addr);
+	void		(*free_static_trb_pool) (void);
+	int		(*xfer_start) (void);
+	int		(*xfer_stop) (void);
+};
+
+void dwc3_register_io_ebc(struct ebc_io *ebc);
+void dwc3_unregister_io_ebc(struct ebc_io *ebc);
 
 /*
  * DWC3 Features to be used as Driver Data

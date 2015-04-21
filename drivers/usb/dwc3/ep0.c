@@ -417,6 +417,9 @@ static int dwc3_ep0_handle_feature(struct dwc3 *dwc,
 			if (dwc->speed != DWC3_DSTS_SUPERSPEED)
 				return -EINVAL;
 
+			if (dwc->is_ebc)
+				break;
+
 			reg = dwc3_readl(dwc->regs, DWC3_DCTL);
 			if (set)
 				reg |= DWC3_DCTL_INITU1ENA;
@@ -430,6 +433,9 @@ static int dwc3_ep0_handle_feature(struct dwc3 *dwc,
 				return -EINVAL;
 			if (dwc->speed != DWC3_DSTS_SUPERSPEED)
 				return -EINVAL;
+
+			if (dwc->is_ebc)
+				break;
 
 			reg = dwc3_readl(dwc->regs, DWC3_DCTL);
 			if (set)
@@ -560,9 +566,12 @@ static int dwc3_ep0_set_config(struct dwc3 *dwc, struct usb_ctrlrequest *ctrl)
 			 * Enable transition to U1/U2 state when
 			 * nothing is pending from application.
 			 */
-			reg = dwc3_readl(dwc->regs, DWC3_DCTL);
-			reg |= (DWC3_DCTL_ACCEPTU1ENA | DWC3_DCTL_ACCEPTU2ENA);
-			dwc3_writel(dwc->regs, DWC3_DCTL, reg);
+			if (!dwc->is_ebc) {
+				reg = dwc3_readl(dwc->regs, DWC3_DCTL);
+				reg |= (DWC3_DCTL_ACCEPTU1ENA
+					| DWC3_DCTL_ACCEPTU2ENA);
+				dwc3_writel(dwc->regs, DWC3_DCTL, reg);
+			}
 
 			dwc->resize_fifos = true;
 			dev_dbg(dwc->dev, "resize fifos flag SET\n");
@@ -775,6 +784,9 @@ static void dwc3_ep0_complete_data(struct dwc3 *dwc,
 	ep0 = dwc->eps[0];
 
 	dwc->ep0_next_event = DWC3_EP0_NRDY_STATUS;
+
+	if (list_empty(&ep0->request_list))
+		return;
 
 	r = next_request(&ep0->request_list);
 	ur = &r->request;
@@ -1014,6 +1026,25 @@ static void dwc3_ep0_xfernotready(struct dwc3 *dwc,
 			dwc3_ep0_end_control_data(dwc, dep);
 			dwc3_ep0_stall_and_restart(dwc);
 			return;
+		}
+
+		/*
+		 * Per databook, if an XferNotready(Data) is received after
+		 * XferComplete(Data), one possible reason is host is trying
+		 * to complete data stage by moving a 0-length packet.
+		 *
+		 * REVISIT in case of other cases
+		 */
+		if (dwc->ep0_next_event == DWC3_EP0_NRDY_STATUS) {
+			u32		size = 0;
+			struct dwc3_ep *dep = dwc->eps[event->endpoint_number];
+
+			if (dep->number == 0)
+				size = dep->endpoint.maxpacket;
+
+			dwc3_ep0_start_trans(dwc, dep->number,
+				dwc->ctrl_req_addr, size,
+				DWC3_TRBCTL_CONTROL_DATA);
 		}
 
 		break;

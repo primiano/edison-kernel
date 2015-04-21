@@ -59,6 +59,7 @@ struct mmc_ios {
 #define MMC_TIMING_UHS_SDR104	6
 #define MMC_TIMING_UHS_DDR50	7
 #define MMC_TIMING_MMC_HS200	8
+#define MMC_TIMING_MMC_HS400	9
 
 #define MMC_SDR_MODE		0
 #define MMC_1_2V_DDR_MODE	1
@@ -78,6 +79,19 @@ struct mmc_ios {
 #define MMC_SET_DRIVER_TYPE_A	1
 #define MMC_SET_DRIVER_TYPE_C	2
 #define MMC_SET_DRIVER_TYPE_D	3
+};
+
+struct mmc_panic_host;
+
+struct mmc_host_panic_ops {
+	void    (*request)(struct mmc_panic_host *, struct mmc_request *);
+	void	(*prepare)(struct mmc_panic_host *);
+	int     (*setup)(struct mmc_panic_host *);
+	void    (*set_ios)(struct mmc_panic_host *);
+	void    (*dumpregs)(struct mmc_panic_host *);
+	int	(*power_on)(struct mmc_panic_host *);
+	int	(*hold_mutex)(struct mmc_panic_host *);
+	void	(*release_mutex)(struct mmc_panic_host *);
 };
 
 struct mmc_host_ops {
@@ -139,6 +153,9 @@ struct mmc_host_ops {
 	int	(*select_drive_strength)(unsigned int max_dtr, int host_drv, int card_drv);
 	void	(*hw_reset)(struct mmc_host *host);
 	void	(*card_event)(struct mmc_host *host);
+	void	(*set_dev_power)(struct mmc_host *, bool);
+	/* Prevent host controller from Auto Clock Gating by busy reading */
+	void	(*busy_wait)(struct mmc_host *mmc, u32 delay);
 };
 
 struct mmc_card;
@@ -193,6 +210,27 @@ struct regulator;
 struct mmc_supply {
 	struct regulator *vmmc;		/* Card power supply */
 	struct regulator *vqmmc;	/* Optional Vccq supply */
+};
+
+struct mmc_panic_host {
+	/*
+	 * DMA buffer for the log
+	 */
+	dma_addr_t      dmabuf;
+	void            *logbuf;
+	const struct mmc_host_panic_ops *panic_ops;
+	unsigned int            panic_ready;
+	unsigned int            totalsecs;
+	unsigned int            max_blk_size;
+	unsigned int            max_blk_count;
+	unsigned int            max_req_size;
+	unsigned int            blkaddr;
+	unsigned int            caps;
+	u32                     ocr;            /* the current OCR setting */
+	struct mmc_ios          ios;            /* current io bus settings */
+	struct mmc_card         *card;
+	struct mmc_host         *mmc;
+	void                    *priv;
 };
 
 struct mmc_host {
@@ -281,6 +319,17 @@ struct mmc_host {
 #define MMC_CAP2_PACKED_CMD	(MMC_CAP2_PACKED_RD | \
 				 MMC_CAP2_PACKED_WR)
 #define MMC_CAP2_NO_PRESCAN_POWERUP (1 << 14)	/* Don't power up before scan */
+#define MMC_CAP2_INIT_CARD_SYNC	(1 << 15)	/* init card in sync mode */
+#define MMC_CAP2_POLL_R1B_BUSY	(1 << 16)	/* host poll R1B busy*/
+#define MMC_CAP2_RPMBPART_NOACC	(1 << 17)	/* RPMB partition no access */
+#define MMC_CAP2_LED_SUPPORT	(1 << 18)	/* led support */
+#define MMC_CAP2_PWCTRL_POWER	(1 << 19)	/* power control card power */
+#define MMC_CAP2_FIXED_NCRC	(1 << 20)	/* fixed NCRC */
+#define MMC_CAP2_HS200_WA	(1 << 21)	/* WA: 100MHz clock in HS200 */
+#define MMC_CAP2_HS400_1_8V_DDR	(1 << 22)	/* support HS400 */
+#define MMC_CAP2_HS400_1_2V_DDR	(1 << 23)	/* support HS400 */
+#define MMC_CAP2_HS400		(MMC_CAP2_HS400_1_8V_DDR | \
+				MMC_CAP2_HS400_1_2V_DDR)
 
 	mmc_pm_flag_t		pm_caps;	/* supported pm features */
 
@@ -362,8 +411,23 @@ struct mmc_host {
 
 	unsigned int		slotno;	/* used for sdio acpi binding */
 
+#ifdef CONFIG_MMC_EMBEDDED_SDIO
+	struct {
+		struct sdio_cis			*cis;
+		struct sdio_cccr		*cccr;
+		struct sdio_embedded_func	*funcs;
+		int				num_funcs;
+	} embedded_sdio_data;
+#endif
+	struct mmc_panic_host *phost;
 	unsigned long		private[0] ____cacheline_aligned;
 };
+
+#define SECTOR_SIZE    512
+int mmc_emergency_init(void);
+int mmc_emergency_write(char *, unsigned int);
+void mmc_alloc_panic_host(struct mmc_host *, const struct mmc_host_panic_ops *);
+void mmc_emergency_setup(struct mmc_host *host);
 
 struct mmc_host *mmc_alloc_host(int extra, struct device *);
 int mmc_add_host(struct mmc_host *);

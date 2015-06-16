@@ -1,6 +1,6 @@
 #undef TRACE_INCLUDE_PATH
 #undef TRACE_INCLUDE_FILE
-#define TRACE_INCLUDE_PATH ../../drivers/tty/serial
+#define TRACE_INCLUDE_PATH ../../drivers/tty/serial/
 #define TRACE_INCLUDE_FILE mfd_trace
 
 #define TRACE_SYSTEM hsu

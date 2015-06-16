@@ -728,7 +728,7 @@ static void int_transfer_complete(struct ssp_drv_context *sspc)
 #endif
 
 	if (sspc->cs_control)
-		sspc->cs_control(!sspc->cs_assert);
+		sspc->cs_control(CS_DEASSERT);
 
 	dev_dbg(dev, "End of transfer. SSSR:%08X\n", read_SSSR(reg));
 	msg = sspc->cur_msg;
@@ -793,22 +793,38 @@ static irqreturn_t ssp_int(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-static void poll_writer(struct work_struct *work)
-{
-	struct ssp_drv_context *sspc =
-		container_of(work, struct ssp_drv_context, poll_write);
-
-	while (sspc->tx < sspc->tx_end)
-		sspc->write(sspc);
-
-}
-
 /*
  * Perform a single transfer.
  */
 static void poll_transfer(unsigned long data)
 {
 	struct ssp_drv_context *sspc = (void *)data;
+
+	bool delay = false;
+
+	if ((intel_mid_identify_sim() == INTEL_MID_CPU_SIMULATION_VP) ||
+	     intel_mid_identify_sim() == INTEL_MID_CPU_SIMULATION_HVP) {
+		delay = true;
+	}
+
+	while (sspc->tx < sspc->tx_end) {
+		/* [REVERT ME] Tangier simulator requires a delay */
+		if (delay)
+			udelay(10);
+		if (ssp_timing_wr) {
+			int timeout = 100;
+			/* It is used as debug UART on Tangier. Since
+			   baud rate = 115200, it needs at least 312us
+			   for one word transferring. Becuase of silicon
+			   issue, it MUST check SFIFOL here instead of
+			   TNF. It is the workaround for A0 stepping*/
+			while (--timeout &&
+					((read_SFIFOL(sspc->ioaddr)) & 0xFFFF))
+				udelay(10);
+		}
+		sspc->write(sspc);
+		sspc->read(sspc);
+	}
 
 	while (!sspc->read(sspc))
 		cpu_relax();
@@ -935,7 +951,7 @@ static int handle_message(struct ssp_drv_context *sspc)
 	u32 cr0, saved_cr0, cr1, saved_cr1;
 	struct device *dev = &sspc->pdev->dev;
 	struct spi_message *msg = sspc->cur_msg;
-	u32 clk_div, saved_speed_hz, speed_hz;
+	u32 clk_div, saved_speed_hz;
 	u8 dma_enabled;
 	u32 timeout;
 	u8 chip_select;
@@ -1107,11 +1123,9 @@ static int handle_message(struct ssp_drv_context *sspc)
 
 		/* recalculate the frequency for each transfer */
 		if (transfer->speed_hz)
-			speed_hz = transfer->speed_hz;
+			clk_div = ssp_get_clk_div(sspc, transfer->speed_hz);
 		else
-			speed_hz = saved_speed_hz;
-
-		clk_div = ssp_get_clk_div(sspc, speed_hz);
+			clk_div = ssp_get_clk_div(sspc, saved_speed_hz);
 
 		cr0 &= ~SSCR0_SCR;
 		cr0 |= (clk_div & 0xFFF) << 8;
@@ -1122,13 +1136,6 @@ static int handle_message(struct ssp_drv_context *sspc)
 					(sspc->quirks & QUIRKS_BIT_BANGING))) {
 			start_bitbanging(sspc);
 		} else {
-
-			/* if speed is higher than 6.25Mhz, enable clock delay */
-			if (speed_hz > 6250000)
-				write_SSCR2((read_SSCR2(reg) | SSCR2_CLK_DEL_EN), reg);
-			else
-				write_SSCR2((read_SSCR2(reg) & ~SSCR2_CLK_DEL_EN), reg);
-
 			/* (re)start the SSP */
 			if (ssp_timing_wr) {
 				dev_dbg(dev, "original cr0 before reset:%x",
@@ -1146,7 +1153,7 @@ static int handle_message(struct ssp_drv_context *sspc)
 		}
 
 		if (sspc->cs_control)
-			sspc->cs_control(sspc->cs_assert);
+			sspc->cs_control(CS_ASSERT);
 
 		if (likely(dma_enabled)) {
 			if (unlikely(sspc->quirks & QUIRKS_USE_PM_QOS))
@@ -1155,14 +1162,13 @@ static int handle_message(struct ssp_drv_context *sspc)
 			dma_transfer(sspc);
 		} else {
 			/* Do the transfer syncronously */
-			queue_work(sspc->wq_poll_write, &sspc->poll_write);
 			poll_transfer((unsigned long)sspc);
 		}
 
 		if (list_is_last(&transfer->transfer_list, &msg->transfers)
 				|| sspc->cs_change) {
 			if (sspc->cs_control)
-				sspc->cs_control(!sspc->cs_assert);
+				sspc->cs_control(CS_DEASSERT);
 		}
 
 	} /* end of list_for_each_entry */
@@ -1201,8 +1207,7 @@ static void pump_messages(struct work_struct *work)
 		sspc->cur_msg = NULL;
 	}
 	spin_unlock_irqrestore(&sspc->lock, flags);
-	pm_runtime_mark_last_busy(dev);
-	pm_runtime_put_autosuspend(dev);
+	pm_runtime_put(dev);
 }
 
 /**
@@ -1233,7 +1238,7 @@ static int setup(struct spi_device *spi)
 
 	chip = spi_get_ctldata(spi);
 	if (!chip) {
-		chip = kzalloc(sizeof(struct chip_data), GFP_KERNEL);
+		chip = kzalloc(sizeof(struct chip_data), GFP_ATOMIC);
 		if (!chip) {
 			dev_err(&spi->dev,
 			"failed setup: can't allocate chip data\n");
@@ -1253,26 +1258,6 @@ static int setup(struct spi_device *spi)
 	/* chip_info isn't always needed */
 	chip->cr1 = 0;
 	if (chip_info) {
-		/* If user requested CS Active High need to verify that there
-		 * is no transfer pending. If this is the case, kindly fail.  */
-		if ((spi->mode & SPI_CS_HIGH) != sspc->cs_assert) {
-			if (sspc->cur_msg) {
-				dev_err(&spi->dev, "message pending... Failing\n");
-				/* A message is currently in transfer. Do not toggle CS */
-				spin_unlock_irqrestore(&sspc->lock, flags);
-				return -EAGAIN;
-			}
-			if (!chip_info->cs_control) {
-				/* unable to control cs by hand */
-				dev_err(&spi->dev,
-						"This CS does not support SPI_CS_HIGH flag\n");
-				spin_unlock_irqrestore(&sspc->lock, flags);
-				return -EINVAL;
-			}
-			sspc->cs_assert = spi->mode & SPI_CS_HIGH;
-			chip_info->cs_control(!sspc->cs_assert);
-		}
-
 		burst_size = chip_info->burst_size;
 		if (burst_size > IMSS_FIFO_BURST_8)
 			burst_size = DFLT_FIFO_BURST_SIZE;
@@ -1300,7 +1285,7 @@ static int setup(struct spi_device *spi)
 		dev_info(&spi->dev, "setting default chip values\n");
 
 		burst_size = DFLT_FIFO_BURST_SIZE;
-		chip->dma_enabled = 1;
+		chip->dma_enabled = 0;
 		if (sspc->quirks & QUIRKS_DMA_USE_NO_TRAIL)
 			chip->timeout = 0;
 		else
@@ -1472,7 +1457,7 @@ static int intel_mid_ssp_spi_probe(struct pci_dev *pdev,
 	if (ssp_cfg_is_spi_slave(ssp_cfg))
 		sspc->quirks |= QUIRKS_SPI_SLAVE_CLOCK_MODE;
 
-	master->mode_bits = SPI_CS_HIGH | SPI_CPOL | SPI_CPHA;
+	master->mode_bits = SPI_CPOL | SPI_CPHA;
 	master->bus_num = ssp_cfg_get_spi_bus_nb(ssp_cfg);
 	master->num_chipselect = 4;
 	master->cleanup = cleanup;
@@ -1556,9 +1541,6 @@ static int intel_mid_ssp_spi_probe(struct pci_dev *pdev,
 	INIT_WORK(&sspc->pump_messages, pump_messages);
 	sspc->workqueue = create_singlethread_workqueue(dev_name(&pdev->dev));
 
-	INIT_WORK(&sspc->poll_write, poll_writer);
-	sspc->wq_poll_write = create_singlethread_workqueue("spi_poll_wr");
-
 	/* Register with the SPI framework */
 	dev_info(dev, "register with SPI framework (bus spi%d)\n",
 			master->bus_num);
@@ -1576,12 +1558,6 @@ static int intel_mid_ssp_spi_probe(struct pci_dev *pdev,
 		pm_qos_add_request(&sspc->pm_qos_req, PM_QOS_CPU_DMA_LATENCY,
 				PM_QOS_DEFAULT_VALUE);
 
-	pm_runtime_set_autosuspend_delay(&pdev->dev, 25);
-	pm_runtime_use_autosuspend(&pdev->dev);
-	pm_runtime_set_active(&pdev->dev);
-	pm_runtime_enable(&pdev->dev);
-	if (!pm_runtime_enabled(&pdev->dev))
-		dev_err(&pdev->dev, "spi runtime pm not enabled!\n");
 	pm_runtime_put_noidle(&pdev->dev);
 	pm_runtime_allow(&pdev->dev);
 

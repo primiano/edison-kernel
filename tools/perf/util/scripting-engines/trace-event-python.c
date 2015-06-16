@@ -19,10 +19,6 @@
  *
  */
 
-#ifdef __mips__
-#include <sgidefs.h>
-#endif
-
 #include <Python.h>
 
 #include <stdio.h>

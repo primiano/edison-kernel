@@ -83,7 +83,8 @@ static void dump_trailer(const struct device *dev, char *buf, int len, int sz)
 static inline u8 ssp_cfg_get_mode(u8 ssp_cfg)
 {
 	if (intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_TANGIER ||
-	    intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_ANNIEDALE)
+	    intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_ANNIEDALE ||
+	    intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_CARBONCANYON)
 		return (ssp_cfg) & 0x03;
 	else
 		return (ssp_cfg) & 0x07;
@@ -92,7 +93,8 @@ static inline u8 ssp_cfg_get_mode(u8 ssp_cfg)
 static inline u8 ssp_cfg_get_spi_bus_nb(u8 ssp_cfg)
 {
 	if (intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_TANGIER ||
-	    intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_ANNIEDALE)
+	    intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_ANNIEDALE ||
+	    intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_CARBONCANYON)
 		return ((ssp_cfg) >> 2) & 0x07;
 	else
 		return ((ssp_cfg) >> 3) & 0x07;
@@ -101,7 +103,8 @@ static inline u8 ssp_cfg_get_spi_bus_nb(u8 ssp_cfg)
 static inline u8 ssp_cfg_is_spi_slave(u8 ssp_cfg)
 {
 	if (intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_TANGIER ||
-	    intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_ANNIEDALE)
+	    intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_ANNIEDALE ||
+	    intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_CARBONCANYON)
 		return (ssp_cfg) & 0x20;
 	else
 		return (ssp_cfg) & 0x40;
@@ -747,10 +750,19 @@ static void int_transfer_complete_work(struct work_struct *work)
 
 static void poll_transfer_complete(struct ssp_drv_context *sspc)
 {
+	struct spi_message *msg;
+
 	/* Update total byte transfered return count actual bytes read */
 	sspc->cur_msg->actual_length += sspc->len - (sspc->rx_end - sspc->rx);
 
 	sspc->cur_msg->status = 0;
+	if (sspc->cs_control)
+		sspc->cs_control(CS_DEASSERT);
+
+	msg = sspc->cur_msg;
+	if (likely(msg->complete))
+		msg->complete(msg->context);
+	complete(&sspc->msg_done);
 }
 
 /**
@@ -793,9 +805,6 @@ static irqreturn_t ssp_int(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-/*
- * Perform a single transfer.
- */
 static void poll_transfer(unsigned long data)
 {
 	struct ssp_drv_context *sspc = (void *)data;
@@ -807,24 +816,25 @@ static void poll_transfer(unsigned long data)
 		delay = true;
 	}
 
-	while (sspc->tx < sspc->tx_end) {
-		/* [REVERT ME] Tangier simulator requires a delay */
-		if (delay)
-			udelay(10);
-		if (ssp_timing_wr) {
-			int timeout = 100;
-			/* It is used as debug UART on Tangier. Since
-			   baud rate = 115200, it needs at least 312us
-			   for one word transferring. Becuase of silicon
-			   issue, it MUST check SFIFOL here instead of
-			   TNF. It is the workaround for A0 stepping*/
-			while (--timeout &&
-					((read_SFIFOL(sspc->ioaddr)) & 0xFFFF))
+	if (sspc->tx)
+		while (sspc->tx != sspc->tx_end) {
+			/* [REVERT ME] Tangier simulator requires a delay */
+			if (delay)
 				udelay(10);
+			if (ssp_timing_wr) {
+				int timeout = 100;
+				/* It is used as debug UART on Tangier. Since
+				   baud rate = 115200, it needs at least 312us
+				   for one word transferring. Becuase of silicon
+				   issue, it MUST check SFIFOL here instead of
+				   TNF. It is the workaround for A0 stepping*/
+				while (--timeout &&
+					((read_SFIFOL(sspc->ioaddr)) & 0xFFFF))
+					udelay(10);
+			}
+			sspc->write(sspc);
+			sspc->read(sspc);
 		}
-		sspc->write(sspc);
-		sspc->read(sspc);
-	}
 
 	while (!sspc->read(sspc))
 		cpu_relax();
@@ -907,19 +917,9 @@ static void start_bitbanging(struct ssp_drv_context *sspc)
 static unsigned int ssp_get_clk_div(struct ssp_drv_context *sspc, int speed)
 {
 	if (sspc->quirks & QUIRKS_PLATFORM_MRFL)
-		/* The clock divider shall stay between 0 and 4095. */
-		return clamp(25000000 / speed - 1, 0, 4095);
+		return max(25000000 / speed, 4) - 1;
 	else
-		return clamp(100000000 / speed - 1, 3, 4095);
-}
-
-
-static int ssp_get_speed(struct ssp_drv_context *sspc, int clk_div)
-{
-	if (sspc->quirks & QUIRKS_PLATFORM_MRFL)
-		return 25000000 / (clk_div + 1);
-	else
-		return 100000000 / (clk_div + 1);
+		return max(100000000 / speed, 4) - 1;
 }
 
 /**
@@ -948,237 +948,133 @@ static int handle_message(struct ssp_drv_context *sspc)
 	struct chip_data *chip = NULL;
 	struct spi_transfer *transfer = NULL;
 	void *reg = sspc->ioaddr;
-	u32 cr0, saved_cr0, cr1, saved_cr1;
+	u32 cr1;
 	struct device *dev = &sspc->pdev->dev;
 	struct spi_message *msg = sspc->cur_msg;
-	u32 clk_div, saved_speed_hz;
-	u8 dma_enabled;
-	u32 timeout;
-	u8 chip_select;
-	u32 mask = 0;
-	int bits_per_word, saved_bits_per_word;
-	unsigned long flags;
+	u32 clk_div;
 
 	chip = spi_get_ctldata(msg->spi);
 
-	/* get every chip data we need to handle atomically the full message */
-	spin_lock_irqsave(&sspc->lock, flags);
-	saved_cr0 = chip->cr0;
-	saved_cr1 = chip->cr1;
-	saved_bits_per_word = msg->spi->bits_per_word;
-	saved_speed_hz = chip->speed_hz;
-	sspc->cs_control = chip->cs_control;
-	timeout = chip->timeout;
-	chip_select = chip->chip_select;
-	dma_enabled = chip->dma_enabled;
-	spin_unlock_irqrestore(&sspc->lock, flags);
+	/* We handle only one transfer message since the protocol module has to
+	   control the out of band signaling. */
+	transfer = list_entry(msg->transfers.next, struct spi_transfer,
+					transfer_list);
 
-	list_for_each_entry(transfer, &msg->transfers, transfer_list) {
+	/* Check transfer length */
+	if (unlikely((transfer->len > MAX_SPI_TRANSFER_SIZE) ||
+		(transfer->len == 0))) {
+		dev_warn(dev, "transfer length null or greater than %d\n",
+			MAX_SPI_TRANSFER_SIZE);
+		dev_warn(dev, "length = %d\n", transfer->len);
+		msg->status = -EINVAL;
 
-		/* Check transfer length */
-		if (unlikely((transfer->len > MAX_SPI_TRANSFER_SIZE) ||
-					(transfer->len == 0))) {
-			dev_warn(dev, "transfer length null or greater than %d\n",
-					MAX_SPI_TRANSFER_SIZE);
-			dev_warn(dev, "length = %d\n", transfer->len);
-			msg->status = -EINVAL;
-
-			if (msg->complete)
-				msg->complete(msg->context);
-			complete(&sspc->msg_done);
-			return 0;
-		}
-
-		/* If the bits_per_word field in non-zero in the spi_transfer provided
-		 * by the user-space, consider this value. Otherwise consider the
-		 * default bits_per_word field from the spi setting. */
-		if (transfer->bits_per_word) {
-			bits_per_word = transfer->bits_per_word;
-			cr0 = saved_cr0;
-			cr0 &= ~(SSCR0_EDSS | SSCR0_DSS);
-			cr0 |= SSCR0_DataSize(bits_per_word > 16 ?
-					bits_per_word - 16 : bits_per_word)
-				| (bits_per_word > 16 ? SSCR0_EDSS : 0);
-		} else {
-			/* Use default value. */
-			bits_per_word = saved_bits_per_word;
-			cr0 = saved_cr0;
-		}
-
-		if ((bits_per_word < MIN_BITS_PER_WORD
-					|| bits_per_word > MAX_BITS_PER_WORD)) {
-			dev_warn(dev, "invalid wordsize\n");
-			msg->status = -EINVAL;
-			if (msg->complete)
-				msg->complete(msg->context);
-			complete(&sspc->msg_done);
-			return 0;
-		}
-
-		/* Check message length and bit per words consistency */
-		if (bits_per_word <= 8)
-			mask = 0;
-		else if (bits_per_word <= 16)
-			mask = 1;
-		else if (bits_per_word <= 32)
-			mask = 3;
-
-		if (transfer->len & mask) {
-			dev_warn(dev,
-					"message rejected : data length %d not multiple of %d "
-					"while in %d bits mode\n",
-					transfer->len,
-					mask + 1,
-					(mask == 1) ? 16 : 32);
-			msg->status = -EINVAL;
-			if (msg->complete)
-				msg->complete(msg->context);
-			complete(&sspc->msg_done);
-			return 0;
-		}
-
-		/* Flush any remaining data (in case of failed previous transfer) */
-		flush(sspc);
-
-		dev_dbg(dev, "%d bits/word, mode %d\n",
-				bits_per_word, msg->spi->mode & 0x3);
-		if (bits_per_word <= 8) {
-			sspc->n_bytes = 1;
-			sspc->read = u8_reader;
-			sspc->write = u8_writer;
-		} else if (bits_per_word <= 16) {
-			sspc->n_bytes = 2;
-			sspc->read = u16_reader;
-			sspc->write = u16_writer;
-		} else if (bits_per_word <= 32) {
-			if (!ssp_timing_wr)
-				cr0 |= SSCR0_EDSS;
-			sspc->n_bytes = 4;
-			sspc->read = u32_reader;
-			sspc->write = u32_writer;
-		}
-		sspc->tx  = (void *)transfer->tx_buf;
-		sspc->rx  = (void *)transfer->rx_buf;
-		sspc->len = transfer->len;
-		sspc->cs_change = transfer->cs_change;
-
-		if (likely(dma_enabled)) {
-			sspc->dma_mapped = map_dma_buffers(sspc);
-			if (unlikely(!sspc->dma_mapped))
-				return 0;
-		}
-		sspc->tx  = (void *)transfer->tx_buf;
-		sspc->rx  = (void *)transfer->rx_buf;
-		sspc->len = transfer->len;
-		sspc->cs_control = chip->cs_control;
-		sspc->cs_change = transfer->cs_change;
-
-		if (likely(chip->dma_enabled)) {
-			sspc->dma_mapped = map_dma_buffers(sspc);
-			if (unlikely(!sspc->dma_mapped))
-				return 0;
-		} else {
-			sspc->write = sspc->tx ? sspc->write : null_writer;
-			sspc->read  = sspc->rx ? sspc->read : null_reader;
-		}
-		sspc->tx_end = sspc->tx + transfer->len;
-		sspc->rx_end = sspc->rx + transfer->len;
-
-		/* [REVERT ME] Bug in status register clear for Tangier simulation */
-		if ((intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_TANGIER) ||
-				(intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_ANNIEDALE)) {
-			if ((intel_mid_identify_sim() != INTEL_MID_CPU_SIMULATION_VP &&
-						(intel_mid_identify_sim() != INTEL_MID_CPU_SIMULATION_HVP)))
-				write_SSSR(sspc->clear_sr, reg);
-		} else /* Clear status  */
-			write_SSSR(sspc->clear_sr, reg);
-
-		/* setup the CR1 control register */
-		cr1 = saved_cr1 | sspc->cr1_sig;
-
-		if (likely(sspc->quirks & QUIRKS_DMA_USE_NO_TRAIL)) {
-			/* in case of len smaller than burst size, adjust the RX     */
-			/* threshold. All other cases will use the default threshold */
-			/* value. The RX fifo threshold must be aligned with the DMA */
-			/* RX transfer size, which may be limited to a multiple of 4 */
-			/* bytes due to 32bits DDR access.                           */
-			if  (sspc->len / sspc->n_bytes <= sspc->rx_fifo_threshold) {
-				u32 rx_fifo_threshold;
-
-				rx_fifo_threshold = (sspc->len & ~(4 - 1)) /
-					sspc->n_bytes;
-				cr1 &= ~(SSCR1_RFT);
-				cr1 |= SSCR1_RxTresh(rx_fifo_threshold) & SSCR1_RFT;
-			} else
-				write_SSTO(timeout, reg);
-		}
-		dev_dbg(dev, "transfer len:%d  n_bytes:%d  cr0:%x  cr1:%x",
-				sspc->len, sspc->n_bytes, cr0, cr1);
-
-		/* first set CR1 */
-		write_SSCR1(cr1, reg);
-
-		if (intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_TANGIER)
-			write_SSFS((1 << chip_select), reg);
-
-		/* recalculate the frequency for each transfer */
-		if (transfer->speed_hz)
-			clk_div = ssp_get_clk_div(sspc, transfer->speed_hz);
-		else
-			clk_div = ssp_get_clk_div(sspc, saved_speed_hz);
-
-		cr0 &= ~SSCR0_SCR;
-		cr0 |= (clk_div & 0xFFF) << 8;
-
-		/* Do bitbanging only if SSP not-enabled or not-synchronized */
-		if (unlikely(((read_SSSR(reg) & SSP_NOT_SYNC) ||
-						(!(read_SSCR0(reg) & SSCR0_SSE))) &&
-					(sspc->quirks & QUIRKS_BIT_BANGING))) {
-			start_bitbanging(sspc);
-		} else {
-			/* (re)start the SSP */
-			if (ssp_timing_wr) {
-				dev_dbg(dev, "original cr0 before reset:%x",
-						cr0);
-				/*we should not disable TUM and RIM interrup*/
-				write_SSCR0(0x0000000F, reg);
-				cr0 &= ~(SSCR0_SSE);
-				dev_dbg(dev, "reset ssp:cr0:%x", cr0);
-				write_SSCR0(cr0, reg);
-				cr0 |= SSCR0_SSE;
-				dev_dbg(dev, "reset ssp:cr0:%x", cr0);
-				write_SSCR0(cr0, reg);
-			} else
-				write_SSCR0(cr0, reg);
-		}
-
-		if (sspc->cs_control)
-			sspc->cs_control(CS_ASSERT);
-
-		if (likely(dma_enabled)) {
-			if (unlikely(sspc->quirks & QUIRKS_USE_PM_QOS))
-				pm_qos_update_request(&sspc->pm_qos_req,
-						MIN_EXIT_LATENCY);
-			dma_transfer(sspc);
-		} else {
-			/* Do the transfer syncronously */
-			poll_transfer((unsigned long)sspc);
-		}
-
-		if (list_is_last(&transfer->transfer_list, &msg->transfers)
-				|| sspc->cs_change) {
-			if (sspc->cs_control)
-				sspc->cs_control(CS_DEASSERT);
-		}
-
-	} /* end of list_for_each_entry */
-
-	/* Now we are done with this entire message */
-	if (!dma_enabled) {
-		if (likely(msg->complete))
+		if (msg->complete)
 			msg->complete(msg->context);
 		complete(&sspc->msg_done);
+		return 0;
 	}
+
+	/* Flush any remaining data (in case of failed previous transfer) */
+	flush(sspc);
+
+	sspc->tx  = (void *)transfer->tx_buf;
+	sspc->rx  = (void *)transfer->rx_buf;
+	sspc->len = transfer->len;
+	sspc->write = chip->write;
+	sspc->read = chip->read;
+	sspc->cs_control = chip->cs_control;
+	sspc->cs_change = transfer->cs_change;
+
+	if (likely(chip->dma_enabled)) {
+		sspc->dma_mapped = map_dma_buffers(sspc);
+		if (unlikely(!sspc->dma_mapped))
+			return 0;
+	} else {
+		sspc->write = sspc->tx ? chip->write : null_writer;
+		sspc->read  = sspc->rx ? chip->read : null_reader;
+	}
+	sspc->tx_end = sspc->tx + transfer->len;
+	sspc->rx_end = sspc->rx + transfer->len;
+
+	/* [REVERT ME] Bug in status register clear for Tangier simulation */
+	if ((intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_TANGIER) ||
+	    (intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_ANNIEDALE) ||
+	    (intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_CARBONCANYON)) {
+		if ((intel_mid_identify_sim() != INTEL_MID_CPU_SIMULATION_VP &&
+		    (intel_mid_identify_sim() != INTEL_MID_CPU_SIMULATION_HVP)))
+			write_SSSR(sspc->clear_sr, reg);
+	} else /* Clear status  */
+		write_SSSR(sspc->clear_sr, reg);
+
+	/* setup the CR1 control register */
+	cr1 = chip->cr1 | sspc->cr1_sig;
+
+	if (likely(sspc->quirks & QUIRKS_DMA_USE_NO_TRAIL)) {
+		/* in case of len smaller than burst size, adjust the RX     */
+		/* threshold. All other cases will use the default threshold */
+		/* value. The RX fifo threshold must be aligned with the DMA */
+		/* RX transfer size, which may be limited to a multiple of 4 */
+		/* bytes due to 32bits DDR access.                           */
+		if  (sspc->len / sspc->n_bytes <= sspc->rx_fifo_threshold) {
+			u32 rx_fifo_threshold;
+
+			rx_fifo_threshold = (sspc->len & ~(4 - 1)) /
+						sspc->n_bytes;
+			cr1 &= ~(SSCR1_RFT);
+			cr1 |= SSCR1_RxTresh(rx_fifo_threshold) & SSCR1_RFT;
+		} else
+			write_SSTO(chip->timeout, reg);
+	}
+
+	dev_dbg(dev, "transfer len:%d  n_bytes:%d  cr0:%x  cr1:%x",
+		sspc->len, sspc->n_bytes, chip->cr0, cr1);
+
+	/* first set CR1 */
+	if (intel_mid_identify_sim() != INTEL_MID_CPU_SIMULATION_SLE)
+		write_SSCR1(cr1, reg);
+
+	if ((intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_TANGIER) ||
+		(intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_ANNIEDALE))
+		write_SSFS((1 << chip->chip_select), reg);
+
+	/* recalculate the frequency for each transfer */
+	clk_div = ssp_get_clk_div(sspc, transfer->speed_hz);
+	chip->cr0 |= clk_div << 8;
+
+	/* Do bitbanging only if SSP not-enabled or not-synchronized */
+	if (unlikely(((read_SSSR(reg) & SSP_NOT_SYNC) ||
+		(!(read_SSCR0(reg) & SSCR0_SSE))) &&
+		(sspc->quirks & QUIRKS_BIT_BANGING))) {
+			start_bitbanging(sspc);
+	} else {
+		/* (re)start the SSP */
+		if (intel_mid_identify_sim() != INTEL_MID_CPU_SIMULATION_SLE) {
+			if (ssp_timing_wr) {
+				dev_dbg(dev, "original cr0 before reset:%x",
+					chip->cr0);
+				/*we should not disable TUM and RIM interrup*/
+				write_SSCR0(0x0000000F, reg);
+				chip->cr0 &= ~(SSCR0_SSE);
+				dev_dbg(dev, "reset ssp:cr0:%x", chip->cr0);
+				write_SSCR0(chip->cr0, reg);
+				chip->cr0 |= SSCR0_SSE;
+				dev_dbg(dev, "reset ssp:cr0:%x", chip->cr0);
+				write_SSCR0(chip->cr0, reg);
+			} else
+				write_SSCR0(chip->cr0, reg);
+		}
+	}
+
+	if (sspc->cs_control)
+		sspc->cs_control(CS_ASSERT);
+
+	if (likely(chip->dma_enabled)) {
+		if (unlikely(sspc->quirks & QUIRKS_USE_PM_QOS))
+			pm_qos_update_request(&sspc->pm_qos_req,
+				MIN_EXIT_LATENCY);
+		dma_transfer(sspc);
+	} else
+		tasklet_schedule(&sspc->poll_transfer);
 
 	return 0;
 }
@@ -1224,25 +1120,20 @@ static int setup(struct spi_device *spi)
 	u32 burst_size;
 	u32 clk_div;
 	static u32 one_time_setup = 1;
-	unsigned long flags;
 
-	spin_lock_irqsave(&sspc->lock, flags);
 	if (!spi->bits_per_word)
 		spi->bits_per_word = DFLT_BITS_PER_WORD;
 
 	if ((spi->bits_per_word < MIN_BITS_PER_WORD
-		|| spi->bits_per_word > MAX_BITS_PER_WORD)) {
-		spin_unlock_irqrestore(&sspc->lock, flags);
+		|| spi->bits_per_word > MAX_BITS_PER_WORD))
 		return -EINVAL;
-	}
 
 	chip = spi_get_ctldata(spi);
 	if (!chip) {
-		chip = kzalloc(sizeof(struct chip_data), GFP_ATOMIC);
+		chip = kzalloc(sizeof(struct chip_data), GFP_KERNEL);
 		if (!chip) {
 			dev_err(&spi->dev,
 			"failed setup: can't allocate chip data\n");
-			spin_unlock_irqrestore(&sspc->lock, flags);
 			return -ENOMEM;
 		}
 	}
@@ -1273,7 +1164,7 @@ static int setup(struct spi_device *spi)
 		/* Request platform-specific gpio and pinmux here since
 		 * it is not possible to get the intel_mid_ssp_spi_chip
 		 * structure in probe */
-		if (one_time_setup && !chip_info->dma_enabled
+		if (one_time_setup
 				&& chip_info->platform_pinmux) {
 			chip_info->platform_pinmux();
 			one_time_setup = 0;
@@ -1285,7 +1176,7 @@ static int setup(struct spi_device *spi)
 		dev_info(&spi->dev, "setting default chip values\n");
 
 		burst_size = DFLT_FIFO_BURST_SIZE;
-		chip->dma_enabled = 0;
+		chip->dma_enabled = 1;
 		if (sspc->quirks & QUIRKS_DMA_USE_NO_TRAIL)
 			chip->timeout = 0;
 		else
@@ -1301,7 +1192,7 @@ static int setup(struct spi_device *spi)
 	/*FIXME:this is workaround.
 	On MRST, in DMA mode, it is very strang that RX fifo can't reach
 	burst size.*/
-	if (sspc->quirks & QUIRKS_PLATFORM_MRFL && chip->dma_enabled)
+	if ((sspc->quirks & QUIRKS_PLATFORM_MRST) && chip->dma_enabled)
 		sspc->rx_fifo_threshold = 1;
 	tx_fifo_threshold = SPI_FIFO_SIZE - sspc->rx_fifo_threshold;
 	chip->cr1 |= (SSCR1_RxTresh(sspc->rx_fifo_threshold) &
@@ -1320,23 +1211,31 @@ static int setup(struct spi_device *spi)
 		chip->cr1 |= SSCR1_SCLKDIR | SSCR1_SFRMDIR;
 	chip->cr1 |= SSCR1_SCFR;        /* clock is not free running */
 
+	dev_dbg(&spi->dev, "%d bits/word, mode %d\n",
+		spi->bits_per_word, spi->mode & 0x3);
 	if (spi->bits_per_word <= 8) {
 		chip->n_bytes = 1;
+		chip->read = null_reader;
+		chip->write = u8_writer;
 	} else if (spi->bits_per_word <= 16) {
 		chip->n_bytes = 2;
+		chip->read = u16_reader;
+		chip->write = u16_writer;
 	} else if (spi->bits_per_word <= 32) {
+		if (!ssp_timing_wr)
+			chip->cr0 |= SSCR0_EDSS;
 		chip->n_bytes = 4;
+		chip->read = u32_reader;
+		chip->write = u32_writer;
 	} else {
 		dev_err(&spi->dev, "invalid wordsize\n");
-		spin_unlock_irqrestore(&sspc->lock, flags);
 		return -EINVAL;
 	}
 
 	if ((sspc->quirks & QUIRKS_SPI_SLAVE_CLOCK_MODE) == 0) {
-		clk_div = ssp_get_clk_div(sspc, spi->max_speed_hz);
-		chip->cr0 |= (clk_div & 0xFFF) << 8;
-		spi->max_speed_hz = ssp_get_speed(sspc, clk_div);
 		chip->speed_hz = spi->max_speed_hz;
+		clk_div = ssp_get_clk_div(sspc, chip->speed_hz);
+		chip->cr0 |= clk_div << 8;
 		dev_dbg(&spi->dev, "spi->max_speed_hz:%d clk_div:%x cr0:%x",
 			spi->max_speed_hz, clk_div, chip->cr0);
 	}
@@ -1346,9 +1245,9 @@ static int setup(struct spi_device *spi)
 	spi_set_ctldata(spi, chip);
 
 	/* setup of sspc members that will not change across transfers */
+	sspc->n_bytes = chip->n_bytes;
 
 	if (chip->dma_enabled) {
-		sspc->n_bytes = chip->n_bytes;
 		intel_mid_ssp_spi_dma_init(sspc);
 		sspc->cr1_sig = SSCR1_TSRE | SSCR1_RSRE;
 		sspc->mask_sr = SSSR_ROR | SSSR_TUR;
@@ -1360,7 +1259,6 @@ static int setup(struct spi_device *spi)
 	}
 	sspc->clear_sr = SSSR_TUR | SSSR_ROR | SSSR_TINT;
 
-	spin_unlock_irqrestore(&sspc->lock, flags);
 	return 0;
 }
 
@@ -1420,6 +1318,21 @@ static int intel_mid_ssp_spi_probe(struct pci_dev *pdev,
 	if (ssp_cfg_get_mode(ssp_cfg) != SSP_CFG_SPI_MODE_ID) {
 		dev_info(dev, "Unsupported SSP mode (%02xh)\n", ssp_cfg);
 		goto err_abort_probe;
+	}
+
+	/*
+	* KKSANAG
+	* Remove registering SSP6(pci:0000:00:07.2)
+	* or it will cause tons of unprovoked interrupts
+	* This issue will be fixed in RTL. Then no need of this
+	* fix
+	*/
+	if (intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_CARBONCANYON) {
+		dev_info(dev, "The devfn (%0xh)\n", pdev->devfn);
+		if (0x2 == (pdev->devfn & 0x03)) {
+			dev_info(dev, "The SSP6 needs to be disabled, causing spurious interrupts\n");
+			goto err_abort_probe;
+		}
 	}
 
 	dev_info(dev, "found PCI SSP controller (ID: %04xh:%04xh cfg: %02xh)\n",
@@ -1505,7 +1418,8 @@ static int intel_mid_ssp_spi_probe(struct pci_dev *pdev,
 	status = request_irq(sspc->irq, ssp_int, IRQF_SHARED,
 		"intel_mid_ssp_spi", sspc);
 
-	if (intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_TANGIER) {
+	if ((intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_TANGIER) ||
+		(intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_ANNIEDALE)) {
 		if ((intel_mid_identify_sim() ==
 				INTEL_MID_CPU_SIMULATION_SLE) ||
 		    (intel_mid_identify_sim() ==
@@ -1515,7 +1429,8 @@ static int intel_mid_ssp_spi_probe(struct pci_dev *pdev,
 			 * also required in Si. */
 			disable_irq_nosync(sspc->irq);
 		}
-		if (intel_mid_identify_sim() == INTEL_MID_CPU_SIMULATION_NONE)
+		if ((intel_mid_identify_sim() == INTEL_MID_CPU_SIMULATION_NONE) ||
+		    (intel_mid_identify_sim() == INTEL_MID_CPU_SIMULATION_SLE))
 			ssp_timing_wr = 1;
 	}
 
@@ -1538,6 +1453,7 @@ static int intel_mid_ssp_spi_probe(struct pci_dev *pdev,
 	INIT_LIST_HEAD(&sspc->queue);
 	init_completion(&sspc->msg_done);
 	spin_lock_init(&sspc->lock);
+	tasklet_init(&sspc->poll_transfer, poll_transfer, (unsigned long)sspc);
 	INIT_WORK(&sspc->pump_messages, pump_messages);
 	sspc->workqueue = create_singlethread_workqueue(dev_name(&pdev->dev));
 

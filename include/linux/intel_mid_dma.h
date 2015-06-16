@@ -32,6 +32,9 @@
 #define SST_MAX_DMA_LEN		4095
 #define SST_MAX_DMA_LEN_MRFLD	131071 /* 2^17 - 1 */
 
+#define MRFL_INSTANCE_SPI3	3
+#define MRFL_INSTANCE_SPI5	5
+#define MRFL_INSTANCE_SPI6	6
 
 /*DMA mode configurations*/
 enum intel_mid_dma_mode {

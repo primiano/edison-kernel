@@ -159,3 +159,9 @@ void *get_anniedale_ops()
 {
 	return &tangier_ops;
 }
+
+/* piggy back on anniedale ops right now */
+void *get_carboncanyon_ops()
+{
+	return &tangier_ops;
+}

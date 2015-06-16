@@ -206,6 +206,7 @@ static int pci_write(struct pci_bus *bus, unsigned int devfn, int where,
 
 static int intel_mid_pci_irq_enable(struct pci_dev *dev)
 {
+#ifndef CONFIG_XEN
 	u8 pin;
 	struct io_apic_irq_attr irq_attr;
 
@@ -216,16 +217,22 @@ static int intel_mid_pci_irq_enable(struct pci_dev *dev)
 	 */
 	irq_attr.ioapic = mp_find_ioapic(dev->irq);
 	if (irq_attr.ioapic < 0)
-		return -1;
+		return -EINVAL;
 	irq_attr.ioapic_pin = dev->irq;
 	irq_attr.trigger = 1; /* level */
-	if (intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_TANGIER)
+	if ((intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_TANGIER) ||
+		(intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_ANNIEDALE) ||
+		(intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_CARBONCANYON))
 		irq_attr.polarity = 0; /* active high */
 	else
 		irq_attr.polarity = 1; /* active low */
 	io_apic_set_pci_routing(&dev->dev, dev->irq, &irq_attr);
 
 	return 0;
+#else
+	xen_register_gsi(dev->irq, -1, 0, 1);
+	return xen_pcifront_enable_irq(dev);
+#endif
 }
 
 struct pci_ops intel_mid_pci_ops = {

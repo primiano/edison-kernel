@@ -23,7 +23,6 @@ snd-rtctimer-objs := rtctimer.o
 snd-hwdep-objs    := hwdep.o
 
 snd-compress-objs := compress_offload.o
-snd-effects-objs := effects_offload.o
 
 obj-$(CONFIG_SND) 		+= snd.o
 obj-$(CONFIG_SND_HWDEP)		+= snd-hwdep.o
@@ -37,4 +36,3 @@ obj-$(CONFIG_SND_OSSEMUL)	+= oss/
 obj-$(CONFIG_SND_SEQUENCER)	+= seq/
 
 obj-$(CONFIG_SND_COMPRESS_OFFLOAD)	+= snd-compress.o
-obj-$(CONFIG_SND_EFFECTS_OFFLOAD)	+= snd-effects.o

@@ -74,9 +74,15 @@ intel_mid_pwm_on_time_divisor(void __iomem *reg, union pwmctrl_reg *pwmctrl,
 	u64 on_time_divisor;
 
 	/* Calculate and set on time divisor */
-	on_time_divisor = duty_cycle * (u64)(PWM_COMPARE_UNIT_SIZE - 1UL);
-	do_div(on_time_divisor, period);
-	on_time_divisor = PWM_COMPARE_UNIT_SIZE - on_time_divisor - 1UL;
+	if (duty_cycle == period) {
+		on_time_divisor = 1UL;
+	} else {
+		on_time_divisor = duty_cycle *
+			(u64)(PWM_COMPARE_UNIT_SIZE - 1UL);
+		do_div(on_time_divisor, period);
+		on_time_divisor = PWM_COMPARE_UNIT_SIZE -
+			on_time_divisor - 1UL;
+	}
 
 	pwmctrl->full = readl(reg);
 	pwmctrl->part.on_time_divisor = on_time_divisor;
@@ -161,11 +167,6 @@ intel_mid_pwm_base_unit(void __iomem *reg, union pwmctrl_reg *pwmctrl,
 			fraction -= numerator;
 		}
 	}
-	/* If both the values are 0, the output will be somehow not correct.
-	 * So if it happens, change the fraction to 1.
-	 */
-	if ((0 == base_unit_fraction) && (0 == base_unit_integer))
-		base_unit_fraction = 1UL;
 
 	pwmctrl->full = readl(reg);
 	pwmctrl->part.base_unit_int = (u32)base_unit_integer;

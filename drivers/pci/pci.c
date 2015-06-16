@@ -59,7 +59,11 @@ static void pci_dev_d3_sleep(struct pci_dev *dev)
 	if (delay < pci_pm_d3_delay)
 		delay = pci_pm_d3_delay;
 
-	msleep(delay);
+	if (delay) {
+		/* convert from ms to us */
+		delay = 1000*delay;
+		usleep_range(delay-10, delay+10);
+	}
 }
 
 #ifdef CONFIG_PCI_DOMAINS
@@ -675,7 +679,12 @@ static void __pci_start_power_transition(struct pci_dev *dev, pci_power_t state)
 		 * because have already delayed for the bridge.
 		 */
 		if (dev->runtime_d3cold) {
-			msleep(dev->d3cold_delay);
+			/*
+			 * msleep(0) will actually sleep for 1 jiffy.
+			 * if d3cold_delay is 0 we don't want to sleep at all.
+			*/
+			if (dev->d3cold_delay > 0)
+				msleep(dev->d3cold_delay);
 			/*
 			 * When powering on a bridge from D3cold, the
 			 * whole hierarchy may be powered on into
@@ -762,10 +771,6 @@ int pci_set_power_state(struct pci_dev *dev, pci_power_t state)
 		 * ignore the request if we're doing anything other than putting
 		 * it into D0 (which would only happen on boot).
 		 */
-		return 0;
-
-	/* Check if we're already there */
-	if (dev->current_state == state)
 		return 0;
 
 	__pci_start_power_transition(dev, state);

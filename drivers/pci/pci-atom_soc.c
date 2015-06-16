@@ -69,6 +69,7 @@ static int __init mid_pci_init(void)
 	case INTEL_ATOM_MFLD:
 	case INTEL_ATOM_CLV:
 	case INTEL_ATOM_MRFLD:
+	case INTEL_ATOM_MOORFLD:
 		pci_set_platform_pm(&mid_pci_platform_pm);
 		break;
 	}

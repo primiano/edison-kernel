@@ -30,10 +30,10 @@
 #include <linux/module.h>
 #include <linux/delay.h>
 #include <linux/platform_device.h>
+#include <asm/intel-mid.h>
 
 #include "dmaengine.h"
 
-#define MAX_CHAN	8 /*max ch across controllers*/
 #include "intel_mid_dma_regs.h"
 
 #define INTEL_MID_DMAC1_ID		0x0814
@@ -47,8 +47,12 @@
 #define INTEL_BYT_LPIO1_DMAC_ID		0x0F06
 #define INTEL_BYT_LPIO2_DMAC_ID		0x0F40
 #define INTEL_BYT_DMAC0_ID		0x0F28
+#define INTEL_CHT_DMAC0_ID             0x22A8
+#define INTEL_CHT_LPIO1_DMAC_ID		0x2286
+#define INTEL_CHT_LPIO2_DMAC_ID		0x22C0
 
 #define LNW_PERIPHRAL_MASK_SIZE		0x20
+#define ENABLE_PARTITION_UPDATE		(BIT(26))
 
 #define INFO(_max_chan, _ch_base, _block_size, _pimr_mask,	\
 		_pimr_base, _dword_trf, _pimr_offset, _pci_id,	\
@@ -78,7 +82,7 @@ Utility Functions*/
 static int get_ch_index(int status, unsigned int base)
 {
 	int i;
-	for (i = 0; i < MAX_CHAN; i++) {
+	for (i = 0; i < MID_MAX_CHAN; i++) {
 		if (status & (1 << (i + base)))
 			return i;
 	}
@@ -88,7 +92,9 @@ static int get_ch_index(int status, unsigned int base)
 static inline bool is_byt_lpio_dmac(struct middma_device *mid)
 {
 	return (mid->pci_id == INTEL_BYT_LPIO1_DMAC_ID ||
-		mid->pci_id == INTEL_BYT_LPIO2_DMAC_ID);
+		mid->pci_id == INTEL_BYT_LPIO2_DMAC_ID ||
+		mid->pci_id == INTEL_CHT_LPIO1_DMAC_ID ||
+		mid->pci_id == INTEL_CHT_LPIO2_DMAC_ID);
 }
 
 static void dump_dma_reg(struct dma_chan *chan)
@@ -444,7 +450,8 @@ static void midc_descriptor_complete(struct intel_mid_dma_chan *midc,
 	struct intel_mid_dma_lli	*llitem;
 	void *param_txd = NULL;
 
-	dma_cookie_complete(txd);
+	pr_debug("tx cookie after complete = %d\n", txd->cookie);
+
 	callback_txd = txd->callback;
 	param_txd = txd->callback_param;
 
@@ -458,6 +465,7 @@ static void midc_descriptor_complete(struct intel_mid_dma_chan *midc,
 			desc->current_lli = 0;
 	}
 	if (midc->raw_tfr) {
+		dma_cookie_complete(txd);
 		list_del(&desc->desc_node);
 		desc->status = DMA_SUCCESS;
 		if (desc->lli != NULL && desc->lli->llp != 0)
@@ -628,6 +636,7 @@ static dma_cookie_t intel_mid_dma_tx_submit(struct dma_async_tx_descriptor *tx)
 	}
 
 	cookie = dma_cookie_assign(tx);
+	pr_debug("Allocated cookie = %d\n", cookie);
 
 	if (list_empty(&midc->active_list))
 		list_add_tail(&desc->desc_node, &midc->active_list);
@@ -673,21 +682,34 @@ static inline void dma_wait_for_suspend(struct dma_chan *chan, unsigned int mask
 	struct middma_device	*mid = to_middma_device(chan->device);
 	struct intel_mid_dma_chan	*midc = to_intel_mid_dma_chan(chan);
 	int i;
+	const int max_loops = 100;
 
 	/* Suspend channel */
 	cfg_lo.cfg_lo = ioread32(midc->ch_regs + CFG_LOW);
 	cfg_lo.cfg_lo |= mask;
 	iowrite32(cfg_lo.cfg_lo, midc->ch_regs + CFG_LOW);
 	/* wait till FIFO gets empty */
-	/* FIFO should be cleared in couple of milli secs */
-	for (i = 0; i < 10; i++) {
+	/* FIFO should be cleared in a couple of milli secs,
+	   but most of the time after a 'cpu_relax' */
+	for (i = 0; i < max_loops; i++) {
 		cfg_lo.cfg_lo = ioread32(midc->ch_regs + CFG_LOW);
 		if (cfg_lo.cfgx.fifo_empty)
 			break;
-	/* use delay since this might called from atomic context */
-		mdelay(1);
+		/* use udelay since this might called from atomic context,
+		   and use incremental backoff time */
+		if (i)
+			udelay(i);
+		else
+			cpu_relax();
 	}
-	pr_debug("waited for %d ms for FIFO to get empty", i);
+
+	if (i == max_loops)
+		pr_info("Waited 5 ms for chan[%d] FIFO to get empty\n",
+			chan->chan_id);
+	else
+		pr_debug("waited for %d loops for chan[%d] FIFO to get empty",
+			i, chan->chan_id);
+
 	iowrite32(DISABLE_CHANNEL(midc->ch_id), mid->dma_base + DMA_CHAN_EN);
 
 	cfg_lo.cfg_lo = ioread32(midc->ch_regs + CFG_LOW);
@@ -778,10 +800,29 @@ static int intel_mid_dma_device_control(struct dma_chan *chan,
 	struct intel_mid_dma_chan	*midc = to_intel_mid_dma_chan(chan);
 	struct middma_device	*mid = to_middma_device(chan->device);
 	struct intel_mid_dma_desc	*desc, *_desc;
+	struct dma_async_tx_descriptor	*txd;
 
 	pr_debug("%s:CMD:%d for channel:%d\n", __func__, cmd, midc->ch_id);
 	if (cmd == DMA_SLAVE_CONFIG)
 		return dma_slave_control(chan, arg);
+
+	/*
+	 * Leverage the DMA_PAUSE/DMA_RESUME for tuntime PM managemnt.
+	 * DMA customer need make sure the channel is stopped before calling
+	 * the DMA_PAUSE here, and don't start DMA channel befor calling
+	 * DMA_RESUME.
+	 */
+	if (cmd == DMA_PAUSE) {
+		midc->in_use = 0;
+		pm_runtime_put(mid->dev);
+		return 0;
+	}
+
+	if (cmd == DMA_RESUME) {
+		midc->in_use = 1;
+		pm_runtime_get_sync(mid->dev);
+		return 0;
+	}
 
 	if (cmd != DMA_TERMINATE_ALL)
 		return -ENXIO;
@@ -791,6 +832,7 @@ static int intel_mid_dma_device_control(struct dma_chan *chan,
 		spin_unlock_bh(&midc->lock);
 		return 0;
 	}
+
 	/* Disable CH interrupts */
 	disable_dma_interrupt(midc);
 	/* clear channel interrupts */
@@ -799,6 +841,10 @@ static int intel_mid_dma_device_control(struct dma_chan *chan,
 	midc->busy = false;
 	midc->descs_allocated = 0;
 	list_for_each_entry_safe(desc, _desc, &midc->active_list, desc_node) {
+		if (desc->status == DMA_IN_PROGRESS) {
+			txd = &desc->txd;
+			dma_cookie_complete(txd);
+		}
 		list_del(&desc->desc_node);
 		if (desc->lli != NULL)
 			dma_pool_free(desc->lli_pool, desc->lli,
@@ -1023,29 +1069,67 @@ static struct dma_async_tx_descriptor *intel_mid_dma_prep_memcpy_v2(
 	cfg_lo.cfgx_v2.dst_burst_align = 1;
 	cfg_lo.cfgx_v2.src_burst_align = 1;
 
-	/*calculate CFG_HI*/
-	if (mids->cfg_mode == LNW_DMA_MEM_TO_MEM) {
-		/*SW HS only*/
-		cfg_hi.cfg_hi = 0;
-	} else {
-		cfg_hi.cfg_hi = 0;
+	/* For  mem to mem transfer, it's SW HS only*/
+	cfg_hi.cfg_hi = 0;
+	/*calculate CFG_HI for mem to/from dev scenario */
+	if (mids->cfg_mode != LNW_DMA_MEM_TO_MEM) {
 		if (midc->dma->pimr_mask) {
+			/* device_instace => SSP0 = 0, SSP1 = 1, SSP2 = 2*/
+			if (mids->device_instance > 2) {
+				pr_err("Invalid SSP identifier\n");
+				return NULL;
+			}
+			cfg_hi.cfgx_v2.src_per = 0;
+			cfg_hi.cfgx_v2.dst_per = 0;
+			if (mids->dma_slave.direction == DMA_MEM_TO_DEV)
+				/* SSP DMA in Tx direction */
+				cfg_hi.cfgx_v2.dst_per = (2 * mids->device_instance) + 1;
+			else if (mids->dma_slave.direction == DMA_DEV_TO_MEM)
+				/* SSP DMA in Rx direction */
+				cfg_hi.cfgx_v2.src_per = (2 * mids->device_instance);
+			else
+				return NULL;
+
+		} else if (midc->dma->pci_id == INTEL_MRFLD_GP_DMAC2_ID) {
 			if (mids->dma_slave.direction == DMA_MEM_TO_DEV) {
 				cfg_hi.cfgx_v2.src_per = 0;
-				if (mids->device_instance == 0)
-					cfg_hi.cfgx_v2.dst_per = 1;
-				if (mids->device_instance == 1)
-					cfg_hi.cfgx_v2.dst_per = 3;
-			} else if (mids->dma_slave.direction == DMA_DEV_TO_MEM) {
-				if (mids->device_instance == 0)
-					cfg_hi.cfgx_v2.src_per = 0;
-				if (mids->device_instance == 1)
-					cfg_hi.cfgx_v2.src_per = 2;
+
+				if (mids->device_instance ==
+					MRFL_INSTANCE_SPI3)
+					cfg_hi.cfgx_v2.dst_per = 0xF;
+				else if (mids->device_instance ==
+					MRFL_INSTANCE_SPI5)
+					cfg_hi.cfgx_v2.dst_per = 0xD;
+				else if (mids->device_instance ==
+					MRFL_INSTANCE_SPI6)
+					cfg_hi.cfgx_v2.dst_per = 0xB;
+				else
+					cfg_hi.cfgx_v2.dst_per = midc->ch_id
+						- midc->dma->chan_base;
+			} else if (mids->dma_slave.direction
+				== DMA_DEV_TO_MEM) {
+				if (mids->device_instance ==
+					MRFL_INSTANCE_SPI3)
+					cfg_hi.cfgx_v2.src_per = 0xE;
+				else if (mids->device_instance ==
+					MRFL_INSTANCE_SPI5)
+					cfg_hi.cfgx_v2.src_per = 0xC;
+				else if (mids->device_instance ==
+					MRFL_INSTANCE_SPI6)
+					cfg_hi.cfgx_v2.src_per = 0xA;
+				else
+					cfg_hi.cfgx_v2.src_per = midc->ch_id
+						- midc->dma->chan_base;
+
 				cfg_hi.cfgx_v2.dst_per = 0;
+			} else {
+				cfg_hi.cfgx_v2.dst_per =
+					cfg_hi.cfgx_v2.src_per = 0;
 			}
 		} else {
-			cfg_hi.cfgx_v2.src_per = cfg_hi.cfgx_v2.dst_per =
-					midc->ch_id - midc->dma->chan_base;
+			cfg_hi.cfgx_v2.src_per =
+				cfg_hi.cfgx_v2.dst_per =
+				midc->ch_id - midc->dma->chan_base;
 		}
 	}
 	/*calculate CTL_HI*/
@@ -1549,16 +1633,16 @@ static irqreturn_t intel_mid_dma_interrupt(int irq, void *data)
 	u32 tfr_status, err_status, block_status;
 	u32 isr;
 
-	/* On Baytrail, the DMAC is sharing IRQ with other devices */
-	if (is_byt_lpio_dmac(mid) && mid->state == SUSPENDED)
-		return IRQ_NONE;
-
 	/*DMA Interrupt*/
 	pr_debug("MDMA:Got an interrupt on irq %d\n", irq);
 	if (!mid) {
 		pr_err("ERR_MDMA:null pointer mid\n");
-		return -EINVAL;
+		return IRQ_NONE;
 	}
+
+	/* On Baytrail, the DMAC is sharing IRQ with other devices */
+	if (is_byt_lpio_dmac(mid) && mid->state == SUSPENDED)
+		return IRQ_NONE;
 
 	/* Read the interrupt status registers */
 	tfr_status = ioread32(mid->dma_base + STATUS_TFR);
@@ -1619,7 +1703,8 @@ static void config_dma_fifo_partition(struct middma_device *dma)
 	iowrite32(DMA_FIFO_SIZE, dma->dma_base + FIFO_PARTITION0_HI);
 	iowrite32(DMA_FIFO_SIZE, dma->dma_base + FIFO_PARTITION1_LO);
 	iowrite32(DMA_FIFO_SIZE, dma->dma_base + FIFO_PARTITION1_HI);
-	iowrite32(DMA_FIFO_SIZE | BIT(26), dma->dma_base + FIFO_PARTITION0_LO);
+	iowrite32(DMA_FIFO_SIZE | ENABLE_PARTITION_UPDATE,
+				dma->dma_base + FIFO_PARTITION0_LO);
 }
 
 /* v1 ops will be used for Medfield & CTP platforms */
@@ -1635,7 +1720,7 @@ static struct intel_mid_dma_ops v1_dma_ops = {
 	.dma_chan_suspend		= intel_mid_dma_chan_suspend_v1,
 };
 
-/* v2 ops will be used in Merrifield and beyond plantforms */
+/* v2 ops will be used in Merrifield and beyond platforms */
 static struct intel_mid_dma_ops v2_dma_ops = {
 	.device_alloc_chan_resources    = intel_mid_dma_alloc_chan_resources,
 	.device_free_chan_resources     = intel_mid_dma_free_chan_resources,
@@ -1836,14 +1921,21 @@ static int intel_mid_dma_probe(struct pci_dev *pdev,
 	struct middma_device *device;
 	u32 base_addr, bar_size;
 	struct intel_mid_dma_probe_info *info;
-	int err;
+	int err = -EINVAL;
 
 	pr_debug("MDMA: probe for %x\n", pdev->device);
 	info = (void *)id->driver_data;
 	pr_debug("MDMA: CH %d, base %d, block len %d, Periphral mask %x\n",
 				info->max_chan, info->ch_base,
 				info->block_size, info->pimr_mask);
-
+	/* REVERT ME: forcing failure of Audio DMA on CRC HVP  */
+	/* Temporary workaround waiting for root causing issue */
+	if ((info->pci_id == INTEL_MRFLD_DMAC0_ID)
+		&& (intel_mid_identify_cpu() == INTEL_MID_CPU_CHIP_CARBONCANYON)
+		&& (intel_mid_identify_sim() == INTEL_MID_CPU_SIMULATION_HVP)) {
+		pr_err("Temporary WA : forcing failure of DMAC0 for CRC HVP\n");
+		goto err_enable_device;
+	}
 	err = pci_enable_device(pdev);
 	if (err)
 		goto err_enable_device;
@@ -1890,7 +1982,7 @@ static int intel_mid_dma_probe(struct pci_dev *pdev,
 		goto err_ioremap;
 
 	pm_runtime_put_noidle(&pdev->dev);
-	pm_runtime_forbid(&pdev->dev);
+	pm_runtime_allow(&pdev->dev);
 	return 0;
 
 err_ioremap:
@@ -2011,11 +2103,28 @@ static struct pci_device_id intel_mid_dma_ids[] = {
 		INFO(4, 0, SST_MAX_DMA_LEN_MRFLD, 0, 0, 0, 0, INTEL_MRFLD_GP_DMAC2_ID, &v2_dma_ops)},
 	{ PCI_VDEVICE(INTEL, INTEL_MRFLD_DMAC0_ID),
 		INFO(2, 6, SST_MAX_DMA_LEN_MRFLD, 0xFF0000, 0xFF340018, 0, 0x10, INTEL_MRFLD_DMAC0_ID, &v2_dma_ops)},
+
+	/* Moorfield */
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_GP_DMAC2_MOOR),
+		INFO(4, 0, SST_MAX_DMA_LEN_MRFLD, 0, 0, 0, 0,
+				PCI_DEVICE_ID_INTEL_GP_DMAC2_MOOR, &v2_dma_ops)},
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_AUDIO_DMAC0_MOOR),
+		INFO(2, 6, SST_MAX_DMA_LEN_MRFLD, 0xFF0000, 0xFF340018, 0, 0x10,
+				PCI_DEVICE_ID_INTEL_AUDIO_DMAC0_MOOR, &v2_dma_ops)},
+
 	/* Baytrail Low Speed Peripheral DMA */
 	{ PCI_VDEVICE(INTEL, INTEL_BYT_LPIO1_DMAC_ID),
 		INFO(6, 0, 2047, 0, 0, 1, 0, INTEL_BYT_LPIO1_DMAC_ID, &v1_dma_ops)},
 	{ PCI_VDEVICE(INTEL, INTEL_BYT_LPIO2_DMAC_ID),
 		INFO(6, 0, 2047, 0, 0, 1, 0, INTEL_BYT_LPIO2_DMAC_ID, &v1_dma_ops)},
+	/* Cherryview Low Speed Peripheral DMA */
+	{ PCI_VDEVICE(INTEL, INTEL_CHT_LPIO1_DMAC_ID),
+		INFO(6, 0, 2047, 0, 0, 1, 0, INTEL_CHT_LPIO1_DMAC_ID,
+			&v1_dma_ops)},
+	{ PCI_VDEVICE(INTEL, INTEL_CHT_LPIO2_DMAC_ID),
+		INFO(6, 0, 2047, 0, 0, 1, 0, INTEL_CHT_LPIO2_DMAC_ID,
+			&v1_dma_ops)},
+
 	{ 0, }
 };
 MODULE_DEVICE_TABLE(pci, intel_mid_dma_ids);
@@ -2025,16 +2134,65 @@ struct intel_mid_dma_probe_info dma_byt_info = {
 	.ch_base = 4,
 	.block_size = 131071,
 	.pimr_mask = 0x00FF0000,
-	.pimr_base = 0xDF540018,
+	.pimr_base = 0, /* get base addr from device table */
 	.dword_trf = 0,
 	.pimr_offset = 0x10,
 	.pci_id = INTEL_BYT_DMAC0_ID,
 	.pdma_ops = &v2_dma_ops,
 };
 
+struct intel_mid_dma_probe_info dma_byt1_info = {
+	.max_chan = 6,
+	.ch_base = 0,
+	.block_size = 2047,
+	.pimr_mask = 0,
+	.pimr_base = 0,
+	.dword_trf = 1,
+	.pimr_offset = 0,
+	.pci_id = INTEL_BYT_LPIO1_DMAC_ID,
+	.pdma_ops = &v1_dma_ops,
+};
+
+
+struct intel_mid_dma_probe_info dma_cht_info = {
+	.max_chan = 4,
+	.ch_base = 4,
+	.block_size = 131071,
+	.pimr_mask = 0x00FF0000,
+	.pimr_base = 0, /* get base addr from device table */
+	.dword_trf = 0,
+	.pimr_offset = 0x10,
+	.pci_id = INTEL_CHT_DMAC0_ID,
+	.pdma_ops = &v2_dma_ops,
+};
+
+struct intel_mid_dma_probe_info dma_cht1_info = {
+	.max_chan = 6,
+	.ch_base = 0,
+	.block_size = 2047,
+	.pimr_mask = 0,
+	.pimr_base = 0,
+	.dword_trf = 1,
+	.pimr_offset = 0,
+	.pci_id = INTEL_CHT_LPIO1_DMAC_ID,
+	.pdma_ops = &v1_dma_ops,
+};
+
+struct intel_mid_dma_probe_info dma_cht2_info = {
+	.max_chan = 6,
+	.ch_base = 0,
+	.block_size = 2047,
+	.pimr_mask = 0,
+	.pimr_base = 0,
+	.dword_trf = 1,
+	.pimr_offset = 0,
+	.pci_id = INTEL_CHT_LPIO2_DMAC_ID,
+	.pdma_ops = &v1_dma_ops,
+};
+
 static const struct dev_pm_ops intel_mid_dma_pm = {
-	SET_SYSTEM_SLEEP_PM_OPS(dma_suspend,
-			dma_resume)
+	.suspend_late = dma_suspend,
+	.resume_early = dma_resume,
 	SET_RUNTIME_PM_OPS(dma_runtime_suspend,
 			dma_runtime_resume,
 			dma_runtime_idle)
@@ -2066,6 +2224,11 @@ struct intel_mid_dma_probe_info *mid_get_acpi_driver_data(const char *hid)
 }
 static const struct acpi_device_id dma_acpi_ids[] = {
 	{ "DMA0F28", (kernel_ulong_t)&dma_byt_info },
+	{ "ADMA0F28", (kernel_ulong_t)&dma_byt_info },
+	{ "INTL9C60", (kernel_ulong_t)&dma_byt1_info },
+	{ "80862286", (kernel_ulong_t)&dma_cht1_info },
+	{ "808622C0", (kernel_ulong_t)&dma_cht2_info },
+	{ "ADMA22A8", (kernel_ulong_t)&dma_cht_info },
 	{ },
 };
 

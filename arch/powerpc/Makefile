@@ -192,9 +192,6 @@ relocs_check: arch/powerpc/relocs_check.pl vmlinux
 zImage: relocs_check
 endif
 
-# These targets cannot be built in parallel
-.NOTPARALLEL: $(BOOT_TARGETS)
-
 $(BOOT_TARGETS1): vmlinux
 	$(Q)$(MAKE) ARCH=ppc64 $(build)=$(boot) $(patsubst %,$(boot)/%,$@)
 $(BOOT_TARGETS2): vmlinux
@@ -241,7 +238,7 @@ endif
 archclean:
 	$(Q)$(MAKE) $(clean)=$(boot)
 
-archprepare: checkbin arch/powerpc/lib/crtsavres.o
+archprepare: checkbin
 
 # Use the file '.tmp_gas_check' for binutils tests, as gas won't output
 # to stdout and these checks are run even on install targets.

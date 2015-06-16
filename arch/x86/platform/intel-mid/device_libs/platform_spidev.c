@@ -26,14 +26,14 @@ static struct intel_mid_ssp_spi_chip chip = {
 	.burst_size = DFLT_FIFO_BURST_SIZE,
 	.timeout = DFLT_TIMEOUT_VAL,
 	/* SPI DMA is currently not usable on Tangier */
-	.dma_enabled = false,
+	.dma_enabled = true,
 	.cs_control = tng_ssp_spi_cs_control,
 	.platform_pinmux = tng_ssp_spi_platform_pinmux,
 };
 
 static void tng_ssp_spi_cs_control(u32 command)
 {
-	gpio_set_value(tng_ssp_spi2_FS_gpio, (command != 0) ? 1 : 0);
+	gpio_set_value(tng_ssp_spi2_FS_gpio, (command == CS_ASSERT) ? 0 : 1);
 }
 
 static void tng_ssp_spi_platform_pinmux(void)

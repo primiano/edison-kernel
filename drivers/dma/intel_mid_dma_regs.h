@@ -54,7 +54,6 @@
 #define DMA_CH_SIZE		0x58
 #define DMA_FIFO_SIZE 0x100080
 
-
 /*CH X REG = (DMA_CH_SIZE)*CH_NO + REG*/
 #define SAR			0x00 /* Source Address Register*/
 #define DAR			0x08 /* Destination Address Register*/
@@ -93,6 +92,8 @@
 #define FIFO_PARTITION1_HI	0x40C
 #define CH_SAI_ERR		0x410
 
+#define SHIM_OFFSET 0x140000
+#define SHIM_ISRX_OFFSET	0x18
 #define CTL_LO_BIT_LLP_DST_EN	27
 #define CTL_LO_BIT_LLP_SRC_EN	28
 

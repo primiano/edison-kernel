@@ -161,6 +161,9 @@ struct intel_mid_ops {
 	DECLARE_INTEL_MID_OPS_INIT(penwell, INTEL_MID_CPU_CHIP_PENWELL) \
 	DECLARE_INTEL_MID_OPS_INIT(cloverview, INTEL_MID_CPU_CHIP_CLOVERVIEW) \
 	DECLARE_INTEL_MID_OPS_INIT(tangier, INTEL_MID_CPU_CHIP_TANGIER) \
+	DECLARE_INTEL_MID_OPS_INIT(anniedale, INTEL_MID_CPU_CHIP_ANNIEDALE) \
+	DECLARE_INTEL_MID_OPS_INIT(carboncanyon, \
+		INTEL_MID_CPU_CHIP_CARBONCANYON) \
 };
 
 static inline enum intel_mid_cpu_type intel_mid_identify_cpu(void)

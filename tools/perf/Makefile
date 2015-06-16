@@ -691,10 +691,9 @@ ifndef NO_SLANG
 	ifneq ($(call try-cc,$(SOURCE_SLANG),$(FLAGS_SLANG),libslang),y)
 		msg := $(warning slang not found, disables TUI support. Please install slang-devel or libslang-dev);
 	else
-		# Some releases like Fedora has /usr/include/slang/slang.h other than /usr/include/slang.h
-		SLANG_INC ?= -idirafter =/usr/include/slang
+		# Fedora has /usr/include/slang/slang.h, but ubuntu /usr/include/slang.h
+		BASIC_CFLAGS += -I/usr/include/slang
 		BASIC_CFLAGS += -DSLANG_SUPPORT
-		BASIC_CFLAGS += $(SLANG_INC)
 		EXTLIBS += -lslang
 		LIB_OBJS += $(OUTPUT)ui/browser.o
 		LIB_OBJS += $(OUTPUT)ui/browsers/annotate.o
@@ -743,7 +742,6 @@ else
 	FLAGS_PERL_EMBED=$(PERL_EMBED_CCOPTS) $(PERL_EMBED_LDOPTS)
 
 	ifneq ($(call try-cc,$(SOURCE_PERL_EMBED),$(FLAGS_PERL_EMBED),perl),y)
-		msg := $(warning libperl not found, disables Perl scripting support. Please install libperl-dev or perl-devel);
 		BASIC_CFLAGS += -DNO_LIBPERL
 	else
                ALL_LDFLAGS += $(PERL_EMBED_LDFLAGS)
@@ -782,10 +780,10 @@ else
 
       PYTHON_CONFIG_SQ := $(call shell-sq,$(PYTHON_CONFIG))
 
-      PYTHON_EMBED_LDOPTS := $(shell pkg-config --libs python 2>/dev/null)
+      PYTHON_EMBED_LDOPTS := $(shell $(PYTHON_CONFIG_SQ) --ldflags 2>/dev/null)
       PYTHON_EMBED_LDFLAGS := $(call strip-libs,$(PYTHON_EMBED_LDOPTS))
       PYTHON_EMBED_LIBADD := $(call grep-libs,$(PYTHON_EMBED_LDOPTS))
-      PYTHON_EMBED_CCOPTS := $(shell pkg-config --cflags python 2>/dev/null)
+      PYTHON_EMBED_CCOPTS := $(shell $(PYTHON_CONFIG_SQ) --cflags 2>/dev/null)
       FLAGS_PYTHON_EMBED := $(PYTHON_EMBED_CCOPTS) $(PYTHON_EMBED_LDOPTS)
 
       ifneq ($(call try-cc,$(SOURCE_PYTHON_EMBED),$(FLAGS_PYTHON_EMBED),python),y)
@@ -1196,7 +1194,7 @@ install-bin: all
 install: install-bin try-install-man
 
 install-python_ext:
-	$(PYTHON_WORD) util/setup.py --quiet install --prefix='$(DESTDIR_SQ)/usr'
+	$(PYTHON_WORD) util/setup.py --quiet install --root='/$(DESTDIR_SQ)'
 
 # 'make install-doc' should call 'make -C Documentation install'
 $(INSTALL_DOC_TARGETS):

@@ -20,8 +20,7 @@
 static struct intel_mid_ssp_spi_chip chip = {
 	.burst_size = DFLT_FIFO_BURST_SIZE,
 	.timeout = DFLT_TIMEOUT_VAL,
-	/* SPI DMA is current not usable on Tangier */
-	.dma_enabled = false,
+	.dma_enabled = true,
 };
 
 void __init *ads7955_platform_data(void *info)
@@ -30,6 +29,7 @@ void __init *ads7955_platform_data(void *info)
 
 	spi_info->mode = SPI_MODE_0;
 
+	spi_info->max_speed_hz = 25000000,
 	spi_info->controller_data = &chip;
 	spi_info->bus_num = FORCE_SPI_BUS_NUM;
 

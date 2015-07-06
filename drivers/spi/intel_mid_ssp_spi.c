@@ -917,7 +917,7 @@ static void start_bitbanging(struct ssp_drv_context *sspc)
 static unsigned int ssp_get_clk_div(struct ssp_drv_context *sspc, int speed)
 {
 	if (sspc->quirks & QUIRKS_PLATFORM_MRFL)
-		return max(25000000 / speed, 4) - 1;
+		return max(25000000 / speed, 1) - 1;
 	else
 		return max(100000000 / speed, 4) - 1;
 }
@@ -1049,6 +1049,11 @@ static int handle_message(struct ssp_drv_context *sspc)
 	} else {
 		/* (re)start the SSP */
 		if (intel_mid_identify_sim() != INTEL_MID_CPU_SIMULATION_SLE) {
+			if (transfer->speed_hz > 6250000)
+				write_SSCR2((read_SSCR2(reg) | SSCR2_CLK_DEL_EN), reg);
+			else
+				write_SSCR2((read_SSCR2(reg) & ~SSCR2_CLK_DEL_EN), reg);
+
 			if (ssp_timing_wr) {
 				dev_dbg(dev, "original cr0 before reset:%x",
 					chip->cr0);
